@@ -1,4 +1,5 @@
 import os
+import json
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 
@@ -14,12 +15,14 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET")
 
+RISK_PER_TRADE = 0.005  # 0.5%
+
 
 def get_trading_client() -> TradingClient:
     if not (ALPACA_API_KEY and ALPACA_API_SECRET):
         raise HTTPException(status_code=500, detail="Alpaca env vars not set")
 
-    # paper=True uses the Alpaca paper endpoint automatically
+    # paper=True uses Alpaca paper endpoint
     return TradingClient(
         api_key=ALPACA_API_KEY,
         secret_key=ALPACA_API_SECRET,
@@ -36,9 +39,6 @@ async def root():
 # ---- ALPACA STATUS CHECK ----
 @app.get("/alpaca-status")
 async def alpaca_status():
-    """
-    Simple check: can we talk to Alpaca and get account info?
-    """
     client = get_trading_client()
 
     try:
@@ -58,12 +58,12 @@ async def alpaca_status():
 @app.post("/webhook")
 async def tradingview_webhook(request: Request):
     """
-    ORB handler:
-    - Read raw body (TradingView alert message)
-    - Classify as ENTRY_LONG / ENTRY_SHORT / EXIT
-    - Place a simple Alpaca order (1 share QQQ) on entry
-    - Close QQQ position on exit
-    - Send a clear message to Discord
+    ORB handler with risk-based sizing:
+    - Parse JSON from TradingView (event, symbol, orHigh/orLow, entryPrice)
+    - Compute qty so that loss at stop = 0.5% of equity
+    - ENTRY_LONG / ENTRY_SHORT -> market order with fractional qty
+    - EXIT -> close QQQ position
+    - Always send a summary to Discord
     """
     if not DISCORD_WEBHOOK_URL:
         raise HTTPException(status_code=500, detail="DISCORD_WEBHOOK_URL not set")
@@ -71,47 +71,82 @@ async def tradingview_webhook(request: Request):
     body_bytes = await request.body()
     body_text = body_bytes.decode() if body_bytes else ""
 
-    # Default values
+    data = None
     event_type = "UNKNOWN"
-    symbol = "QQQ"  # v1 is QQQ only
-
-    if "ORB_QQQ_ENTRY_LONG" in body_text:
-        event_type = "ENTRY_LONG"
-    elif "ORB_QQQ_ENTRY_SHORT" in body_text:
-        event_type = "ENTRY_SHORT"
-    elif "ORB_QQQ_EXIT" in body_text:
-        event_type = "EXIT"
-
+    symbol = "QQQ"
     alpaca_result = "No trading action taken."
 
-    # --- Very simple trading logic v1: 1 share QQQ ---
+    # Try to parse JSON payload from TradingView
+    if body_text.strip().startswith("{"):
+        try:
+            data = json.loads(body_text)
+        except json.JSONDecodeError:
+            data = None
+
+    if data:
+        event_type = data.get("event", "UNKNOWN")
+        symbol = data.get("symbol", "QQQ")
+    else:
+        # Fallback if we ever get plain text again
+        if "ORB_QQQ_ENTRY_LONG" in body_text:
+            event_type = "ENTRY_LONG"
+        elif "ORB_QQQ_ENTRY_SHORT" in body_text:
+            event_type = "ENTRY_SHORT"
+        elif "ORB_QQQ_EXIT" in body_text:
+            event_type = "EXIT"
+
+    # ---- TRADING LOGIC v1: RISK-BASED SIZING, SIMPLE EXITS ----
     try:
         client = get_trading_client()
 
-        if event_type == "ENTRY_LONG":
-            order = client.submit_order(
-                order_data=MarketOrderRequest(
-                    symbol=symbol,
-                    qty=1,  # v1: fixed size
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                )
-            )
-            alpaca_result = f"Placed LONG market order for 1 share of {symbol}. Order ID: {order.id}"
+        if event_type in ("ENTRY_LONG", "ENTRY_SHORT") and data:
+            try:
+                entry_price = float(data.get("entryPrice"))
+                or_high = float(data.get("orHigh"))
+                or_low = float(data.get("orLow"))
+            except (TypeError, ValueError):
+                entry_price = None
 
-        elif event_type == "ENTRY_SHORT":
-            order = client.submit_order(
-                order_data=MarketOrderRequest(
-                    symbol=symbol,
-                    qty=1,  # v1: fixed size
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY,
-                )
-            )
-            alpaca_result = f"Placed SHORT market order for 1 share of {symbol} (or reduced long). Order ID: {order.id}"
+            if entry_price is None:
+                alpaca_result = "Missing or invalid price data for risk sizing."
+            else:
+                # Determine stop price based on OR
+                if event_type == "ENTRY_LONG":
+                    stop_price = or_low
+                else:  # ENTRY_SHORT
+                    stop_price = or_high
+
+                risk_per_share = abs(entry_price - stop_price)
+
+                if risk_per_share <= 0:
+                    alpaca_result = f"Invalid risk_per_share ({risk_per_share}), no order placed."
+                else:
+                    # Get account equity for 0.5% risk
+                    account = client.get_account()
+                    equity = float(str(account.equity))
+                    dollar_risk = equity * RISK_PER_TRADE
+
+                    qty = dollar_risk / risk_per_share
+
+                    if qty <= 0:
+                        alpaca_result = f"Calculated qty <= 0 (qty={qty}), no order placed."
+                    else:
+                        side = OrderSide.BUY if event_type == "ENTRY_LONG" else OrderSide.SELL
+
+                        order = client.submit_order(
+                            order_data=MarketOrderRequest(
+                                symbol=symbol,
+                                qty=qty,  # fractional qty allowed in paper
+                                side=side,
+                                time_in_force=TimeInForce.DAY,
+                            )
+                        )
+                        alpaca_result = (
+                            f"Placed {event_type} market order for ~{qty:.4f} shares of {symbol}. "
+                            f"Order ID: {order.id}"
+                        )
 
         elif event_type == "EXIT":
-            # Close any open position in QQQ (long or short)
             try:
                 close_resp = client.close_position(symbol)
                 alpaca_result = f"Closed position in {symbol}. Response: {close_resp}"
@@ -119,7 +154,6 @@ async def tradingview_webhook(request: Request):
                 alpaca_result = f"Tried to close position in {symbol}, but got error: {e}"
 
     except HTTPException:
-        # Re-raise HTTP exceptions (env vars etc.)
         raise
     except Exception as e:
         alpaca_result = f"Alpaca trading error: {e}"
