@@ -1,134 +1,156 @@
 #!/usr/bin/env python3
 """
-SIMPLE ORB DISCORD BOT - GUARANTEED TO WORK
-Simplified version focusing on core functionality
+SIMPLE TRADINGVIEW → DISCORD NOTIFICATIONS
+Just receives TradingView alerts and sends Discord messages
+No complex bot commands needed!
 """
 
-import discord
-from discord.ext import commands
-import os
-import asyncio
 from flask import Flask, request, jsonify
-import threading
+import requests
+import os
+from datetime import datetime
 
-# Simple bot setup
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-# Flask app for webhooks
 app = Flask(__name__)
 
-# Bot settings
-trading_enabled = False
-account_balance = 10000.0
-positions = {}
+# Discord webhook URL (you'll set this in Railway environment variables)
+DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL', '')
 
-@bot.event
-async def on_ready():
-    print(f'✅ {bot.user} is online and ready!')
-    print(f'✅ Connected to {len(bot.guilds)} servers')
-
-@bot.command(name='help')
-async def help_cmd(ctx):
-    """Show help"""
-    embed = discord.Embed(title="🤖 ORB Trading Bot", color=0x00ff00)
-    embed.add_field(name="Commands", value="""
-    `!help` - Show this message
-    `!start` - Start trading
-    `!stop` - Stop trading  
-    `!status` - Show status
-    `!ping` - Test bot response
-    """, inline=False)
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def ping(ctx):
-    """Test command"""
-    await ctx.send('🏓 Pong! Bot is working!')
-
-@bot.command()
-async def start(ctx):
-    """Start trading"""
-    global trading_enabled
-    trading_enabled = True
-    embed = discord.Embed(title="🟢 Trading Started", color=0x00ff00)
-    embed.add_field(name="Status", value="Ready for signals", inline=False)
-    embed.add_field(name="Webhook", value=f"Send alerts to your Railway URL/webhook", inline=False)
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def stop(ctx):
-    """Stop trading"""
-    global trading_enabled
-    trading_enabled = False
-    embed = discord.Embed(title="🔴 Trading Stopped", color=0xff0000)
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def status(ctx):
-    """Show status"""
-    embed = discord.Embed(title="📊 Bot Status", color=0x0099ff)
-    embed.add_field(name="Trading", value="🟢 Active" if trading_enabled else "🔴 Stopped", inline=True)
-    embed.add_field(name="Balance", value=f"${account_balance:,.2f}", inline=True)
-    embed.add_field(name="Positions", value=len(positions), inline=True)
-    await ctx.send(embed=embed)
-
-# Flask routes
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({
-        "status": "healthy",
-        "bot_connected": bot.is_ready(),
-        "trading_enabled": trading_enabled,
-        "balance": account_balance
-    })
+def send_discord_notification(message, color=0x00ff00):
+    """Send message to Discord channel via webhook"""
+    if not DISCORD_WEBHOOK_URL:
+        print("❌ Discord webhook URL not set")
+        return
+    
+    data = {
+        "embeds": [{
+            "title": "📊 ORB Trading Alert",
+            "description": message,
+            "color": color,
+            "timestamp": datetime.utcnow().isoformat()
+        }]
+    }
+    
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        if response.status_code == 204:
+            print("✅ Discord notification sent")
+        else:
+            print(f"❌ Discord error: {response.status_code}")
+    except Exception as e:
+        print(f"❌ Discord notification failed: {e}")
 
 @app.route('/webhook', methods=['POST'])
-def webhook():
+def trading_webhook():
+    """Receive TradingView alerts and send Discord notifications"""
     try:
         data = request.get_json()
-        print(f"📨 Webhook received: {data}")
+        print(f"📨 Received: {data}")
         
-        # Send notification to Discord (if bot is ready)
-        if bot.is_ready():
-            # This is a simple test - just print for now
-            print(f"✅ Would execute trade: {data}")
+        # Parse the alert data
+        symbol = data.get('symbol', 'Unknown')
+        action = data.get('action', 'signal')  # signal, entry, exit
+        direction = data.get('direction', '')  # long/short
+        price = data.get('price', 0)
+        
+        # Create different messages based on action type
+        if action == 'signal':
+            # ORB signal detected
+            message = f"🚨 **ORB Signal Detected - {symbol}**\n"
+            message += f"📊 Direction: **{direction.upper()}**\n" 
+            message += f"💰 Price: **${price}**\n"
+            message += f"⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
+            color = 0xffaa00  # Orange for signals
             
-        return jsonify({"status": "success", "message": "Signal received"})
+        elif action == 'entry':
+            # Trade executed
+            stop_loss = data.get('stop_loss', 0)
+            take_profit = data.get('take_profit', 0)
+            
+            message = f"🚀 **Trade Executed - {symbol}**\n"
+            message += f"📊 **{direction.upper()}** position opened\n"
+            message += f"💰 Entry: **${price}**\n"
+            message += f"🛑 Stop Loss: **${stop_loss}**\n"
+            message += f"🎯 Take Profit: **${take_profit}**\n"
+            message += f"⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
+            color = 0x00ff00  # Green for entries
+            
+        elif action == 'exit':
+            # Trade closed
+            entry_price = data.get('entry_price', 0)
+            exit_reason = data.get('reason', 'Unknown')
+            pnl = data.get('pnl', 0)
+            
+            pnl_emoji = "📈" if pnl > 0 else "📉"
+            color = 0x00ff00 if pnl > 0 else 0xff0000
+            
+            message = f"{pnl_emoji} **Position Closed - {symbol}**\n"
+            message += f"📊 Reason: **{exit_reason}**\n"
+            message += f"💰 Entry: **${entry_price}** → Exit: **${price}**\n"
+            message += f"💵 P&L: **${pnl:+.2f}**\n"
+            message += f"⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
+            
+        else:
+            # Generic message
+            message = f"📊 **{symbol}** - {action}\n"
+            message += f"💰 Price: **${price}**\n"
+            message += f"⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
+            color = 0x0099ff
+        
+        # Send to Discord
+        send_discord_notification(message, color)
+        
+        return jsonify({"status": "success", "message": "Alert processed"})
+        
     except Exception as e:
         print(f"❌ Webhook error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
 
-@app.route('/')
-def home():
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
     return jsonify({
-        "message": "ORB Trading Bot is running!",
-        "bot_status": "online" if bot.is_ready() else "offline",
-        "endpoints": {
-            "health": "/health",
-            "webhook": "/webhook"
-        }
+        "status": "healthy",
+        "discord_webhook_configured": bool(DISCORD_WEBHOOK_URL),
+        "timestamp": datetime.utcnow().isoformat()
     })
 
-def run_flask():
-    """Run Flask in background"""
+@app.route('/')
+def home():
+    """Home page"""
+    return jsonify({
+        "message": "TradingView → Discord Webhook Service",
+        "status": "running",
+        "endpoints": {
+            "webhook": "/webhook (POST) - Receive TradingView alerts",
+            "health": "/health (GET) - Health check"
+        },
+        "discord_configured": bool(DISCORD_WEBHOOK_URL)
+    })
+
+@app.route('/test', methods=['POST', 'GET'])
+def test_notification():
+    """Test Discord notification"""
+    if request.method == 'POST':
+        # Test with custom message
+        data = request.get_json() or {}
+        message = data.get('message', 'Test notification from webhook service')
+    else:
+        # Simple GET test
+        message = "🧪 **Test Alert**\nWebhook service is working correctly!"
+    
+    send_discord_notification(message)
+    return jsonify({"status": "success", "message": "Test notification sent"})
+
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    print("🚀 Starting TradingView → Discord Webhook Service")
+    print(f"📡 Webhook URL: http://localhost:{port}/webhook")
+    print(f"🔍 Health check: http://localhost:{port}/health")
+    print(f"🧪 Test endpoint: http://localhost:{port}/test")
+    
+    if DISCORD_WEBHOOK_URL:
+        print("✅ Discord webhook configured")
+    else:
+        print("⚠️  Discord webhook URL not set - add DISCORD_WEBHOOK_URL environment variable")
+    
     app.run(host='0.0.0.0', port=port, debug=False)
-
-def main():
-    # Get Discord token
-    discord_token = os.environ.get('DISCORD_BOT_TOKEN')
-    if not discord_token:
-        print("❌ DISCORD_BOT_TOKEN environment variable not set!")
-        return
-    
-    print("🚀 Starting Flask server...")
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    print("🤖 Starting Discord bot...")
-    bot.run(discord_token)
-
-if __name__ == "__main__":
-    main()
