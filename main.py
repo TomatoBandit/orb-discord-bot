@@ -1,12 +1,10 @@
 import os
-import json
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 
 app = FastAPI()
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-WEBHOOK_SECRET = os.environ.get("TRADINGVIEW_WEBHOOK_SECRET")  # optional, but recommended
 
 
 @app.get("/")
@@ -16,28 +14,25 @@ async def root():
 
 @app.post("/webhook")
 async def tradingview_webhook(request: Request):
+    """
+    Minimal debug webhook:
+    - Does NOT try to parse JSON
+    - Just forwards the raw body text to Discord
+    """
     if not DISCORD_WEBHOOK_URL:
         raise HTTPException(status_code=500, detail="DISCORD_WEBHOOK_URL not set")
 
-    data = await request.json()
+    body_bytes = await request.body()
+    body_text = body_bytes.decode() if body_bytes else ""
 
-    # Optional: secret check for basic security
-    if WEBHOOK_SECRET:
-        incoming_secret = data.get("secret")
-        if incoming_secret != WEBHOOK_SECRET:
-            raise HTTPException(status_code=401, detail="Invalid secret")
-
-    # Nicely format the payload for Discord so we can debug
-    pretty = json.dumps(data, indent=2)
-
-    message = (
+    content = (
         "**TradingView Alert Received**\n"
-        "```json\n"
-        f"{pretty}\n"
+        "```text\n"
+        f"{body_text or '[empty body]'}\n"
         "```"
     )
 
     async with httpx.AsyncClient() as client:
-        await client.post(DISCORD_WEBHOOK_URL, json={"content": message})
+        await client.post(DISCORD_WEBHOOK_URL, json={"content": content})
 
     return {"status": "ok"}
