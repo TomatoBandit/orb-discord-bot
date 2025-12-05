@@ -380,8 +380,27 @@ class ORBTradingBot(commands.Bot):
     
     # Discord Commands
     
-    @commands.command(name='orb_start')
-    async def start_trading(self, ctx):
+    @commands.command(name='help')
+    async def help_command(self, ctx):
+        """Show ORB bot help"""
+        embed = discord.Embed(title="🤖 ORB Trading Bot Commands", color=0x0099ff)
+        
+        commands_list = [
+            "🟢 `!orb_start` - Start accepting TradingView signals",
+            "🔴 `!orb_stop` - Stop accepting signals", 
+            "📊 `!orb_status` - View trading status and positions",
+            "⚙️ `!orb_settings` - View/change trading settings",
+            "❓ `!help` - Show this help message"
+        ]
+        
+        embed.add_field(name="Commands", value="\n".join(commands_list), inline=False)
+        
+        embed.add_field(name="🔗 Webhook URL", value="Point TradingView alerts to:\n`https://your-bot-url.com/webhook`", inline=False)
+        
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def orb_start(self, ctx):
         """Start ORB trading"""
         self.trading_enabled = True
         self.trading_channel_id = ctx.channel.id
@@ -396,8 +415,8 @@ class ORBTradingBot(commands.Bot):
         
         await ctx.send(embed=embed)
     
-    @commands.command(name='orb_stop')
-    async def stop_trading(self, ctx):
+    @commands.command()
+    async def orb_stop(self, ctx):
         """Stop ORB trading"""
         self.trading_enabled = False
         
@@ -409,8 +428,8 @@ class ORBTradingBot(commands.Bot):
         
         await ctx.send(embed=embed)
     
-    @commands.command(name='orb_status')
-    async def trading_status(self, ctx):
+    @commands.command()
+    async def orb_status(self, ctx):
         """Get trading status"""
         embed = discord.Embed(
             title="📊 ORB Trading Status",
@@ -435,8 +454,8 @@ class ORBTradingBot(commands.Bot):
         
         await ctx.send(embed=embed)
     
-    @commands.command(name='orb_settings')
-    async def show_settings(self, ctx, setting=None, value=None):
+    @commands.command()
+    async def orb_settings(self, ctx, setting=None, value=None):
         """View or change trading settings"""
         if setting and value:
             # Update setting
@@ -462,25 +481,6 @@ class ORBTradingBot(commands.Bot):
         embed.add_field(name="🎭 Trading Mode", value="📝 Paper" if self.paper_trading else "💰 Live", inline=True)
         
         embed.add_field(name="📋 Usage", value="`!orb_settings risk 2` - Set 2% risk\n`!orb_settings max_position 1500` - Set $1500 max\n`!orb_settings mode paper` - Paper trading", inline=False)
-        
-        await ctx.send(embed=embed)
-    
-    @commands.command(name='orb_help')
-    async def help_command(self, ctx):
-        """Show ORB bot help"""
-        embed = discord.Embed(title="🤖 ORB Trading Bot Commands", color=0x0099ff)
-        
-        commands_list = [
-            "🟢 `!orb_start` - Start accepting TradingView signals",
-            "🔴 `!orb_stop` - Stop accepting signals", 
-            "📊 `!orb_status` - View trading status and positions",
-            "⚙️ `!orb_settings` - View/change trading settings",
-            "❓ `!orb_help` - Show this help message"
-        ]
-        
-        embed.add_field(name="Commands", value="\n".join(commands_list), inline=False)
-        
-        embed.add_field(name="🔗 Webhook URL", value="Point TradingView alerts to:\n`https://your-bot-url.com/webhook`", inline=False)
         
         await ctx.send(embed=embed)
 
