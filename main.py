@@ -22,11 +22,10 @@ def get_trading_client() -> TradingClient:
     if not (ALPACA_API_KEY and ALPACA_API_SECRET):
         raise HTTPException(status_code=500, detail="Alpaca env vars not set")
 
-    # paper=True uses Alpaca paper endpoint
     return TradingClient(
         api_key=ALPACA_API_KEY,
         secret_key=ALPACA_API_SECRET,
-        paper=True,
+        paper=True,  # paper endpoint
     )
 
 
@@ -58,12 +57,10 @@ async def alpaca_status():
 @app.post("/webhook")
 async def tradingview_webhook(request: Request):
     """
-    ORB handler with risk-based sizing:
-    - Parse JSON from TradingView (event, symbol, orHigh/orLow, entryPrice)
-    - Compute qty so that loss at stop = 0.5% of equity
-    - ENTRY_LONG / ENTRY_SHORT -> market order with fractional qty
-    - EXIT -> close QQQ position
-    - Always send a summary to Discord
+    ORB handler with:
+    - Risk-based entries (0.5% per trade, fractional shares)
+    - 50% partial at 2R
+    - Final exit (trailing stop or EOD)
     """
     if not DISCORD_WEBHOOK_URL:
         raise HTTPException(status_code=500, detail="DISCORD_WEBHOOK_URL not set")
@@ -76,7 +73,7 @@ async def tradingview_webhook(request: Request):
     symbol = "QQQ"
     alpaca_result = "No trading action taken."
 
-    # Try to parse JSON payload from TradingView
+    # Try to parse JSON from TradingView
     if body_text.strip().startswith("{"):
         try:
             data = json.loads(body_text)
@@ -87,18 +84,18 @@ async def tradingview_webhook(request: Request):
         event_type = data.get("event", "UNKNOWN")
         symbol = data.get("symbol", "QQQ")
     else:
-        # Fallback if we ever get plain text again
+        # Fallback for older plain-text alerts
         if "ORB_QQQ_ENTRY_LONG" in body_text:
             event_type = "ENTRY_LONG"
         elif "ORB_QQQ_ENTRY_SHORT" in body_text:
             event_type = "ENTRY_SHORT"
         elif "ORB_QQQ_EXIT" in body_text:
-            event_type = "EXIT"
+            event_type = "FINAL_EXIT"
 
-    # ---- TRADING LOGIC v1: RISK-BASED SIZING, SIMPLE EXITS ----
     try:
         client = get_trading_client()
 
+        # ---- ENTRIES: 0.5% risk, fractional size ----
         if event_type in ("ENTRY_LONG", "ENTRY_SHORT") and data:
             try:
                 entry_price = float(data.get("entryPrice"))
@@ -110,7 +107,7 @@ async def tradingview_webhook(request: Request):
             if entry_price is None:
                 alpaca_result = "Missing or invalid price data for risk sizing."
             else:
-                # Determine stop price based on OR
+                # Determine stop based on OR
                 if event_type == "ENTRY_LONG":
                     stop_price = or_low
                 else:  # ENTRY_SHORT
@@ -121,7 +118,6 @@ async def tradingview_webhook(request: Request):
                 if risk_per_share <= 0:
                     alpaca_result = f"Invalid risk_per_share ({risk_per_share}), no order placed."
                 else:
-                    # Get account equity for 0.5% risk
                     account = client.get_account()
                     equity = float(str(account.equity))
                     dollar_risk = equity * RISK_PER_TRADE
@@ -136,7 +132,7 @@ async def tradingview_webhook(request: Request):
                         order = client.submit_order(
                             order_data=MarketOrderRequest(
                                 symbol=symbol,
-                                qty=qty,  # fractional qty allowed in paper
+                                qty=qty,  # fractional qty
                                 side=side,
                                 time_in_force=TimeInForce.DAY,
                             )
@@ -146,10 +142,40 @@ async def tradingview_webhook(request: Request):
                             f"Order ID: {order.id}"
                         )
 
-        elif event_type == "EXIT":
+        # ---- PARTIAL EXIT: close 50% of current position ----
+        elif event_type == "PARTIAL_EXIT":
+            try:
+                position = client.get_open_position(symbol)
+                pos_qty = float(str(position.qty))
+                pos_side = str(position.side).lower()  # 'long' or 'short'
+                if pos_qty <= 0:
+                    alpaca_result = "No open position size to partially exit."
+                else:
+                    half_qty = pos_qty / 2.0
+                    exit_side = (
+                        OrderSide.SELL if pos_side == "long" else OrderSide.BUY
+                    )
+
+                    order = client.submit_order(
+                        order_data=MarketOrderRequest(
+                            symbol=symbol,
+                            qty=half_qty,
+                            side=exit_side,
+                            time_in_force=TimeInForce.DAY,
+                        )
+                    )
+                    alpaca_result = (
+                        f"PARTIAL_EXIT: Closed ~50% ({half_qty:.4f} shares) of {symbol} "
+                        f"({pos_side}). Order ID: {order.id}"
+                    )
+            except Exception as e:
+                alpaca_result = f"Error during PARTIAL_EXIT for {symbol}: {e}"
+
+        # ---- FINAL EXIT: close entire position ----
+        elif event_type in ("FINAL_EXIT", "EXIT"):
             try:
                 close_resp = client.close_position(symbol)
-                alpaca_result = f"Closed position in {symbol}. Response: {close_resp}"
+                alpaca_result = f"FINAL_EXIT: Closed position in {symbol}. Response: {close_resp}"
             except Exception as e:
                 alpaca_result = f"Tried to close position in {symbol}, but got error: {e}"
 
@@ -158,7 +184,7 @@ async def tradingview_webhook(request: Request):
     except Exception as e:
         alpaca_result = f"Alpaca trading error: {e}"
 
-    # ---- Send a summary to Discord ----
+    # ---- Discord summary ----
     content = (
         "**ORB Signal Received**\n"
         f"Symbol: `{symbol}`\n"
