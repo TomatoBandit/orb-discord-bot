@@ -43,6 +43,17 @@ def symbol_for_positions(symbol: str) -> str:
     return symbol.replace("/", "") if "/" in symbol else symbol
 
 
+def tif_for_symbol(symbol: str) -> TimeInForce:
+    """
+    Alpaca crypto does NOT allow TimeInForce.DAY.
+    - For crypto symbols (with '/'), use GTC.
+    - For regular stock/ETF symbols, use DAY.
+    """
+    if "/" in symbol:
+        return TimeInForce.GTC
+    return TimeInForce.DAY
+
+
 # ---- SIMPLE IN-MEMORY DAILY STATE ----
 current_day = None
 daily_loss_r = 0.0
@@ -191,18 +202,20 @@ async def tradingview_webhook(request: Request):
                                 else OrderSide.SELL
                             )
 
+                            tif = tif_for_symbol(symbol)
+
                             # Use 'symbol' exactly as sent from TradingView for orders
                             order = client.submit_order(
                                 order_data=MarketOrderRequest(
                                     symbol=symbol,
                                     qty=qty,  # fractional qty
                                     side=side,
-                                    time_in_force=TimeInForce.DAY,
+                                    time_in_force=tif,
                                 )
                             )
                             trade_count += 1
                             alpaca_result = (
-                                f"Placed {event_type} market order for ~{qty:.4f} shares of {symbol}. "
+                                f"Placed {event_type} market order for ~{qty:.4f} units of {symbol}. "
                                 f"Order ID: {order.id}. "
                                 f"trade_count today = {trade_count}."
                             )
@@ -224,13 +237,15 @@ async def tradingview_webhook(request: Request):
                         OrderSide.SELL if pos_side == "long" else OrderSide.BUY
                     )
 
+                    tif = tif_for_symbol(symbol)
+
                     # Use original 'symbol' for the order itself
                     order = client.submit_order(
                         order_data=MarketOrderRequest(
                             symbol=symbol,
                             qty=half_qty,
                             side=exit_side,
-                            time_in_force=TimeInForce.DAY,
+                            time_in_force=tif,
                         )
                     )
                     alpaca_result = (
@@ -240,7 +255,7 @@ async def tradingview_webhook(request: Request):
             except Exception as e:
                 alpaca_result = f"Error during PARTIAL_EXIT for {symbol}: {e}"
 
-        # ---- FINAL EXIT: close entire position & update daily R if stop loser ----
+            # ---- FINAL EXIT: close entire position & update daily R if stop loser ----
         elif event_type == "FINAL_EXIT":
             try:
                 close_symbol = symbol_for_positions(symbol)
