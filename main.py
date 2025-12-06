@@ -320,18 +320,33 @@ async def tradingview_webhook(request: Request):
         alpaca_result = f"Alpaca trading error: {e}"
 
     # ---- Discord summary ----
+    # Pick an emoji based on event type / reason
+    emoji = "ℹ️"
+    if event_type == "ENTRY_LONG":
+        emoji = "🟢"
+    elif event_type == "ENTRY_SHORT":
+        emoji = "🔴"
+    elif event_type == "PARTIAL_EXIT":
+        emoji = "🟡"
+    elif event_type == "FINAL_EXIT":
+        if reason == "STOP_PHASE1":
+            emoji = "❌"
+        elif reason == "TRAIL_STOP":
+            emoji = "✅"
+        elif reason == "EOD":
+            emoji = "🌙"
+
+    body_preview = body_text or "[empty body]"
+
     content = (
-        "**ORB Signal Received**\n"
-        f"Symbol: `{symbol}`\n"
-        f"Event: `{event_type}`\n"
-        f"Reason: `{reason}`\n"
-        f"Alpaca result: {alpaca_result}\n"
-        f"Daily loss (R): {daily_loss_r}\n"
-        f"Trades today: {trade_count}\n"
-        f"Guardrail info: {guardrail_info or 'None'}\n\n"
-        "Raw message from TradingView:\n"
+        f"{emoji} **QQQ ORB Bot**\n\n"
+        f"**Symbol:** `{symbol}`  |  **Event:** `{event_type}`\n"
+        f"**Reason:** `{reason or 'n/a'}`\n"
+        f"**Alpaca:** {alpaca_result}\n\n"
+        f"**Day:** `R = {daily_loss_r}`  |  `Trades = {trade_count}`\n"
+        f"**Guardrails:** {guardrail_info or 'None'}\n\n"
         "```text\n"
-        f"{body_text or '[empty body]'}\n"
+        f"{body_preview}\n"
         "```"
     )
 
@@ -339,4 +354,5 @@ async def tradingview_webhook(request: Request):
         await client_http.post(DISCORD_WEBHOOK_URL, json={"content": content})
 
     return {"status": "ok"}
+
 
