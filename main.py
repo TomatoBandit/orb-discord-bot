@@ -36,7 +36,7 @@ def get_trading_client() -> TradingClient:
 def symbol_for_positions(symbol: str) -> str:
     """
     Alpaca quirk:
-    - Orders: 'BTC/USD' works
+    - Orders: 'BTC/USD' would work for crypto orders (if enabled)
     - Positions endpoints (get_open_position, close_position): often expect 'BTCUSD'
     For non-crypto symbols like 'QQQ', this just returns the symbol unchanged.
     """
@@ -45,13 +45,16 @@ def symbol_for_positions(symbol: str) -> str:
 
 def tif_for_symbol(symbol: str) -> TimeInForce:
     """
-    Alpaca crypto does NOT allow TimeInForce.DAY.
-    - For crypto symbols (with '/'), use GTC.
-    - For regular stock/ETF symbols, use DAY.
+    For equities/ETFs we'll use DAY.
+    (Crypto is disabled for this account, but if we ever re-enable it,
+    they'd typically use GTC.)
     """
-    if "/" in symbol:
-        return TimeInForce.GTC
     return TimeInForce.DAY
+
+
+def is_crypto_symbol(symbol: str) -> bool:
+    """Very simple crypto detector: symbols with '/' like 'BTC/USD'."""
+    return "/" in symbol
 
 
 # ---- SIMPLE IN-MEMORY DAILY STATE ----
@@ -73,7 +76,7 @@ def reset_daily_if_needed():
 # ---- BASIC HEALTH CHECK ----
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "ORB bot webhook is running"}
+    return {"status": "ok", "message": "ORB bot webhook is running (QQQ only)"}
 
 
 # ---- ALPACA STATUS CHECK ----
@@ -98,11 +101,12 @@ async def alpaca_status():
 @app.post("/webhook")
 async def tradingview_webhook(request: Request):
     """
-    ORB / BTC handler with:
-    - Risk-based entries (0.5% per trade, fractional size)
+    ORB handler with:
+    - Risk-based entries (0.5% per trade, fractional size) for equities
     - 50% partial at 2R
     - Final exit (trailing stop or EOD)
     - Daily guardrails: max 3 trades, max -2R per day (combined across symbols)
+    - Crypto symbols (with '/') are IGNORED for trading (log-only).
     """
     if not DISCORD_WEBHOOK_URL:
         raise HTTPException(status_code=500, detail="DISCORD_WEBHOOK_URL not set")
@@ -144,150 +148,171 @@ async def tradingview_webhook(request: Request):
 
     global daily_loss_r, trade_count
 
+    is_crypto = is_crypto_symbol(symbol)
+
     try:
         client = get_trading_client()
 
-        # ---- ENTRIES: 0.5% risk, fractional size, daily guardrails ----
+        # ---- ENTRIES ----
         if event_type in ("ENTRY_LONG", "ENTRY_SHORT") and data:
-            # Guardrails: check before placing order
-            if daily_loss_r <= -MAX_DAILY_LOSS_R:
+            if is_crypto:
+                # BTC / any crypto -> no trades, just log
                 alpaca_result = (
-                    f"Entry blocked: daily loss limit reached (daily_loss_r={daily_loss_r}R)."
+                    f"ENTRY signal for crypto symbol {symbol} received, "
+                    f"but this bot is configured as QQQ-only. No order placed."
                 )
-                guardrail_info = "Blocked by -2R daily limit."
-            elif trade_count >= MAX_TRADES_PER_DAY:
-                alpaca_result = (
-                    f"Entry blocked: max trades per day reached (trade_count={trade_count})."
-                )
-                guardrail_info = "Blocked by 3-trades-per-day limit."
+                guardrail_info = "Crypto disabled in this account."
             else:
-                # Proceed with risk-based sizing
-                try:
-                    entry_price = float(data.get("entryPrice"))
-                    or_high = float(data.get("orHigh"))
-                    or_low = float(data.get("orLow"))
-                except (TypeError, ValueError):
-                    entry_price = None
-
-                if entry_price is None or entry_price <= 0:
-                    alpaca_result = "Missing or invalid price data for risk sizing."
+                # Guardrails: check before placing order
+                if daily_loss_r <= -MAX_DAILY_LOSS_R:
+                    alpaca_result = (
+                        f"Entry blocked: daily loss limit reached (daily_loss_r={daily_loss_r}R)."
+                    )
+                    guardrail_info = "Blocked by -2R daily limit."
+                elif trade_count >= MAX_TRADES_PER_DAY:
+                    alpaca_result = (
+                        f"Entry blocked: max trades per day reached (trade_count={trade_count})."
+                    )
+                    guardrail_info = "Blocked by 3-trades-per-day limit."
                 else:
-                    # Determine stop based on OR or ATR-encoded stop
-                    if event_type == "ENTRY_LONG":
-                        stop_price = or_low
-                    else:  # ENTRY_SHORT
-                        stop_price = or_high
+                    # Proceed with risk-based sizing
+                    try:
+                        entry_price = float(data.get("entryPrice"))
+                        or_high = float(data.get("orHigh"))
+                        or_low = float(data.get("orLow"))
+                    except (TypeError, ValueError):
+                        entry_price = None
 
-                    risk_per_unit = abs(entry_price - stop_price)
-
-                    if risk_per_unit <= 0:
-                        alpaca_result = (
-                            f"Invalid risk_per_unit ({risk_per_unit}), no order placed."
-                        )
+                    if entry_price is None or entry_price <= 0:
+                        alpaca_result = "Missing or invalid price data for risk sizing."
                     else:
-                        account = client.get_account()
-                        equity = float(str(account.equity))
+                        # Determine stop based on OR / encoded stop
+                        if event_type == "ENTRY_LONG":
+                            stop_price = or_low
+                        else:  # ENTRY_SHORT
+                            stop_price = or_high
 
-                        if equity <= 0:
+                        risk_per_unit = abs(entry_price - stop_price)
+
+                        if risk_per_unit <= 0:
                             alpaca_result = (
-                                f"Equity <= 0 (equity={equity}), no order placed."
+                                f"Invalid risk_per_unit ({risk_per_unit}), no order placed."
                             )
                         else:
-                            # 1) Size from risk (0.5% R)
-                            dollar_risk = equity * RISK_PER_TRADE
-                            qty_from_risk = dollar_risk / risk_per_unit
+                            account = client.get_account()
+                            equity = float(str(account.equity))
 
-                            # 2) Cap by what the account can actually afford notionally
-                            max_qty_notional = equity / entry_price
-                            qty = min(qty_from_risk, max_qty_notional)
-
-                            if qty <= 0:
+                            if equity <= 0:
                                 alpaca_result = (
-                                    f"Calculated qty <= 0 (qty={qty}), no order placed."
+                                    f"Equity <= 0 (equity={equity}), no order placed."
                                 )
                             else:
-                                side = (
-                                    OrderSide.BUY
-                                    if event_type == "ENTRY_LONG"
-                                    else OrderSide.SELL
-                                )
+                                # 1) Size from risk (0.5% R)
+                                dollar_risk = equity * RISK_PER_TRADE
+                                qty_from_risk = dollar_risk / risk_per_unit
 
-                                tif = tif_for_symbol(symbol)
+                                # 2) Cap by what the account can actually afford notionally
+                                max_qty_notional = equity / entry_price
+                                qty = min(qty_from_risk, max_qty_notional)
 
-                                # Use 'symbol' exactly as sent from TradingView for orders
-                                order = client.submit_order(
-                                    order_data=MarketOrderRequest(
-                                        symbol=symbol,
-                                        qty=qty,  # fractional qty
-                                        side=side,
-                                        time_in_force=tif,
+                                if qty <= 0:
+                                    alpaca_result = (
+                                        f"Calculated qty <= 0 (qty={qty}), no order placed."
                                     )
-                                )
-                                trade_count += 1
-                                alpaca_result = (
-                                    f"Placed {event_type} market order for ~{qty:.6f} units of {symbol}. "
-                                    f"Order ID: {order.id}. "
-                                    f"trade_count today = {trade_count}."
-                                )
+                                else:
+                                    side = (
+                                        OrderSide.BUY
+                                        if event_type == "ENTRY_LONG"
+                                        else OrderSide.SELL
+                                    )
+
+                                    tif = tif_for_symbol(symbol)
+
+                                    order = client.submit_order(
+                                        order_data=MarketOrderRequest(
+                                            symbol=symbol,
+                                            qty=qty,  # fractional qty for equities is fine
+                                            side=side,
+                                            time_in_force=tif,
+                                        )
+                                    )
+                                    trade_count += 1
+                                    alpaca_result = (
+                                        f"Placed {event_type} market order for ~{qty:.6f} units of {symbol}. "
+                                        f"Order ID: {order.id}. "
+                                        f"trade_count today = {trade_count}."
+                                    )
 
         # ---- PARTIAL EXIT: close 50% of current position ----
         elif event_type == "PARTIAL_EXIT":
-            try:
-                # Use normalized symbol for positions API (e.g. BTCUSD)
-                pos_symbol = symbol_for_positions(symbol)
-                position = client.get_open_position(pos_symbol)
-                pos_qty = float(str(position.qty))
-                pos_side = str(position.side).lower()  # 'long' or 'short'
+            if is_crypto:
+                alpaca_result = (
+                    f"PARTIAL_EXIT for crypto symbol {symbol} ignored: "
+                    f"bot is QQQ-only. No order sent."
+                )
+                guardrail_info = "Crypto disabled in this account."
+            else:
+                try:
+                    pos_symbol = symbol_for_positions(symbol)
+                    position = client.get_open_position(pos_symbol)
+                    pos_qty = float(str(position.qty))
+                    pos_side = str(position.side).lower()  # 'long' or 'short'
 
-                if pos_qty <= 0:
-                    alpaca_result = "No open position size to partially exit."
-                else:
-                    half_qty = pos_qty / 2.0
-                    exit_side = (
-                        OrderSide.SELL if pos_side == "long" else OrderSide.BUY
-                    )
-
-                    tif = tif_for_symbol(symbol)
-
-                    # Use original 'symbol' for the order itself
-                    order = client.submit_order(
-                        order_data=MarketOrderRequest(
-                            symbol=symbol,
-                            qty=half_qty,
-                            side=exit_side,
-                            time_in_force=tif,
+                    if pos_qty <= 0:
+                        alpaca_result = "No open position size to partially exit."
+                    else:
+                        half_qty = pos_qty / 2.0
+                        exit_side = (
+                            OrderSide.SELL if pos_side == "long" else OrderSide.BUY
                         )
-                    )
-                    alpaca_result = (
-                        f"PARTIAL_EXIT: Closed ~50% ({half_qty:.6f} units) of {symbol} "
-                        f"({pos_side}). Order ID: {order.id}"
-                    )
-            except Exception as e:
-                alpaca_result = f"Error during PARTIAL_EXIT for {symbol}: {e}"
+
+                        tif = tif_for_symbol(symbol)
+
+                        order = client.submit_order(
+                            order_data=MarketOrderRequest(
+                                symbol=symbol,
+                                qty=half_qty,
+                                side=exit_side,
+                                time_in_force=tif,
+                            )
+                        )
+                        alpaca_result = (
+                            f"PARTIAL_EXIT: Closed ~50% ({half_qty:.6f} units) of {symbol} "
+                            f"({pos_side}). Order ID: {order.id}"
+                        )
+                except Exception as e:
+                    alpaca_result = f"Error during PARTIAL_EXIT for {symbol}: {e}"
 
         # ---- FINAL EXIT: close entire position & update daily R if stop loser ----
         elif event_type == "FINAL_EXIT":
-            try:
-                close_symbol = symbol_for_positions(symbol)
-                close_resp = client.close_position(close_symbol)
+            if is_crypto:
                 alpaca_result = (
-                    f"FINAL_EXIT: Closed position in {symbol} "
-                    f"(pos symbol {close_symbol}). Response: {close_resp}"
+                    f"FINAL_EXIT for crypto symbol {symbol} ignored: "
+                    f"bot is QQQ-only. No order sent."
                 )
-
-                # If this was a full stop before any partial was taken, count -1R
-                if reason == "STOP_PHASE1":
-                    daily_loss_r -= 1.0
-                    guardrail_info = (
-                        f"Recorded -1R loss (reason=STOP_PHASE1). "
-                        f"daily_loss_r now = {daily_loss_r}R."
+                guardrail_info = "Crypto disabled in this account."
+            else:
+                try:
+                    close_symbol = symbol_for_positions(symbol)
+                    close_resp = client.close_position(close_symbol)
+                    alpaca_result = (
+                        f"FINAL_EXIT: Closed position in {symbol} "
+                        f"(pos symbol {close_symbol}). Response: {close_resp}"
                     )
 
-            except Exception as e:
-                alpaca_result = (
-                    f"Tried to close position in {symbol} "
-                    f"(pos symbol {symbol_for_positions(symbol)}), but got error: {e}"
-                )
+                    # If this was a full stop before any partial was taken, count -1R
+                    if reason == "STOP_PHASE1":
+                        daily_loss_r -= 1.0
+                        guardrail_info = (
+                            f"Recorded -1R loss (reason=STOP_PHASE1). "
+                            f"daily_loss_r now = {daily_loss_r}R."
+                        )
+
+                except Exception as e:
+                    alpaca_result = (
+                        f"Tried to close position in {symbol} "
+                        f"(pos symbol {symbol_for_positions(symbol)}), but got error: {e}"
+                    )
 
     except HTTPException:
         raise
@@ -314,3 +339,4 @@ async def tradingview_webhook(request: Request):
         await client_http.post(DISCORD_WEBHOOK_URL, json={"content": content})
 
     return {"status": "ok"}
+
