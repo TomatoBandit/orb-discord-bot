@@ -19,7 +19,7 @@ ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET")
 
 RISK_PER_TRADE = 0.005         # 0.5% of equity per trade
 MAX_DAILY_LOSS_R = 2.0         # -2R per day
-MAX_TRADES_PER_DAY = 3         # 3 entries per day
+MAX_TRADES_PER_DAY = 3         # 3 entries per day (combined across symbols)
 
 
 def get_trading_client() -> TradingClient:
@@ -31,6 +31,16 @@ def get_trading_client() -> TradingClient:
         secret_key=ALPACA_API_SECRET,
         paper=True,  # paper endpoint
     )
+
+
+def symbol_for_positions(symbol: str) -> str:
+    """
+    Alpaca quirk:
+    - Orders: 'BTC/USD' works
+    - Positions endpoints (get_open_position, close_position): often expect 'BTCUSD'
+    For non-crypto symbols like 'QQQ', this just returns the symbol unchanged.
+    """
+    return symbol.replace("/", "") if "/" in symbol else symbol
 
 
 # ---- SIMPLE IN-MEMORY DAILY STATE ----
@@ -77,11 +87,11 @@ async def alpaca_status():
 @app.post("/webhook")
 async def tradingview_webhook(request: Request):
     """
-    ORB handler with:
-    - Risk-based entries (0.5% per trade, fractional shares)
+    ORB / BTC handler with:
+    - Risk-based entries (0.5% per trade, fractional size)
     - 50% partial at 2R
     - Final exit (trailing stop or EOD)
-    - Daily guardrails: max 3 trades, max -2R per day
+    - Daily guardrails: max 3 trades, max -2R per day (combined across symbols)
     """
     if not DISCORD_WEBHOOK_URL:
         raise HTTPException(status_code=500, detail="DISCORD_WEBHOOK_URL not set")
@@ -113,10 +123,13 @@ async def tradingview_webhook(request: Request):
         # Fallback for older plain-text alerts (if any)
         if "ORB_QQQ_ENTRY_LONG" in body_text:
             event_type = "ENTRY_LONG"
+            symbol = "QQQ"
         elif "ORB_QQQ_ENTRY_SHORT" in body_text:
             event_type = "ENTRY_SHORT"
+            symbol = "QQQ"
         elif "ORB_QQQ_EXIT" in body_text:
             event_type = "FINAL_EXIT"
+            symbol = "QQQ"
 
     global daily_loss_r, trade_count
 
@@ -148,7 +161,7 @@ async def tradingview_webhook(request: Request):
                 if entry_price is None:
                     alpaca_result = "Missing or invalid price data for risk sizing."
                 else:
-                    # Determine stop based on OR
+                    # Determine stop based on OR or ATR-encoded stop
                     if event_type == "ENTRY_LONG":
                         stop_price = or_low
                     else:  # ENTRY_SHORT
@@ -157,7 +170,9 @@ async def tradingview_webhook(request: Request):
                     risk_per_share = abs(entry_price - stop_price)
 
                     if risk_per_share <= 0:
-                        alpaca_result = f"Invalid risk_per_share ({risk_per_share}), no order placed."
+                        alpaca_result = (
+                            f"Invalid risk_per_share ({risk_per_share}), no order placed."
+                        )
                     else:
                         account = client.get_account()
                         equity = float(str(account.equity))
@@ -166,10 +181,17 @@ async def tradingview_webhook(request: Request):
                         qty = dollar_risk / risk_per_share
 
                         if qty <= 0:
-                            alpaca_result = f"Calculated qty <= 0 (qty={qty}), no order placed."
+                            alpaca_result = (
+                                f"Calculated qty <= 0 (qty={qty}), no order placed."
+                            )
                         else:
-                            side = OrderSide.BUY if event_type == "ENTRY_LONG" else OrderSide.SELL
+                            side = (
+                                OrderSide.BUY
+                                if event_type == "ENTRY_LONG"
+                                else OrderSide.SELL
+                            )
 
+                            # Use 'symbol' exactly as sent from TradingView for orders
                             order = client.submit_order(
                                 order_data=MarketOrderRequest(
                                     symbol=symbol,
@@ -188,9 +210,12 @@ async def tradingview_webhook(request: Request):
         # ---- PARTIAL EXIT: close 50% of current position ----
         elif event_type == "PARTIAL_EXIT":
             try:
-                position = client.get_open_position(symbol)
+                # Use normalized symbol for positions API (e.g. BTCUSD)
+                pos_symbol = symbol_for_positions(symbol)
+                position = client.get_open_position(pos_symbol)
                 pos_qty = float(str(position.qty))
                 pos_side = str(position.side).lower()  # 'long' or 'short'
+
                 if pos_qty <= 0:
                     alpaca_result = "No open position size to partially exit."
                 else:
@@ -199,6 +224,7 @@ async def tradingview_webhook(request: Request):
                         OrderSide.SELL if pos_side == "long" else OrderSide.BUY
                     )
 
+                    # Use original 'symbol' for the order itself
                     order = client.submit_order(
                         order_data=MarketOrderRequest(
                             symbol=symbol,
@@ -208,7 +234,7 @@ async def tradingview_webhook(request: Request):
                         )
                     )
                     alpaca_result = (
-                        f"PARTIAL_EXIT: Closed ~50% ({half_qty:.4f} shares) of {symbol} "
+                        f"PARTIAL_EXIT: Closed ~50% ({half_qty:.4f} units) of {symbol} "
                         f"({pos_side}). Order ID: {order.id}"
                     )
             except Exception as e:
@@ -217,18 +243,26 @@ async def tradingview_webhook(request: Request):
         # ---- FINAL EXIT: close entire position & update daily R if stop loser ----
         elif event_type == "FINAL_EXIT":
             try:
-                close_resp = client.close_position(symbol)
-                alpaca_result = f"FINAL_EXIT: Closed position in {symbol}. Response: {close_resp}"
+                close_symbol = symbol_for_positions(symbol)
+                close_resp = client.close_position(close_symbol)
+                alpaca_result = (
+                    f"FINAL_EXIT: Closed position in {symbol} "
+                    f"(pos symbol {close_symbol}). Response: {close_resp}"
+                )
 
                 # If this was a full stop before any partial was taken, count -1R
                 if reason == "STOP_PHASE1":
                     daily_loss_r -= 1.0
                     guardrail_info = (
-                        f"Recorded -1R loss (reason=STOP_PHASE1). daily_loss_r now = {daily_loss_r}R."
+                        f"Recorded -1R loss (reason=STOP_PHASE1). "
+                        f"daily_loss_r now = {daily_loss_r}R."
                     )
 
             except Exception as e:
-                alpaca_result = f"Tried to close position in {symbol}, but got error: {e}"
+                alpaca_result = (
+                    f"Tried to close position in {symbol} "
+                    f"(pos symbol {symbol_for_positions(symbol)}), but got error: {e}"
+                )
 
     except HTTPException:
         raise
