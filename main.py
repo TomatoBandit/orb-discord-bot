@@ -131,7 +131,7 @@ async def tradingview_webhook(request: Request):
         symbol = data.get("symbol", "QQQ")
         reason = data.get("reason")
     else:
-        # Fallback for older plain-text alerts (if any)
+        # Fallback for any legacy plain-text alerts
         if "ORB_QQQ_ENTRY_LONG" in body_text:
             event_type = "ENTRY_LONG"
             symbol = "QQQ"
@@ -169,7 +169,7 @@ async def tradingview_webhook(request: Request):
                 except (TypeError, ValueError):
                     entry_price = None
 
-                if entry_price is None:
+                if entry_price is None or entry_price <= 0:
                     alpaca_result = "Missing or invalid price data for risk sizing."
                 else:
                     # Determine stop based on OR or ATR-encoded stop
@@ -178,47 +178,57 @@ async def tradingview_webhook(request: Request):
                     else:  # ENTRY_SHORT
                         stop_price = or_high
 
-                    risk_per_share = abs(entry_price - stop_price)
+                    risk_per_unit = abs(entry_price - stop_price)
 
-                    if risk_per_share <= 0:
+                    if risk_per_unit <= 0:
                         alpaca_result = (
-                            f"Invalid risk_per_share ({risk_per_share}), no order placed."
+                            f"Invalid risk_per_unit ({risk_per_unit}), no order placed."
                         )
                     else:
                         account = client.get_account()
                         equity = float(str(account.equity))
-                        dollar_risk = equity * RISK_PER_TRADE
 
-                        qty = dollar_risk / risk_per_share
-
-                        if qty <= 0:
+                        if equity <= 0:
                             alpaca_result = (
-                                f"Calculated qty <= 0 (qty={qty}), no order placed."
+                                f"Equity <= 0 (equity={equity}), no order placed."
                             )
                         else:
-                            side = (
-                                OrderSide.BUY
-                                if event_type == "ENTRY_LONG"
-                                else OrderSide.SELL
-                            )
+                            # 1) Size from risk (0.5% R)
+                            dollar_risk = equity * RISK_PER_TRADE
+                            qty_from_risk = dollar_risk / risk_per_unit
 
-                            tif = tif_for_symbol(symbol)
+                            # 2) Cap by what the account can actually afford notionally
+                            max_qty_notional = equity / entry_price
+                            qty = min(qty_from_risk, max_qty_notional)
 
-                            # Use 'symbol' exactly as sent from TradingView for orders
-                            order = client.submit_order(
-                                order_data=MarketOrderRequest(
-                                    symbol=symbol,
-                                    qty=qty,  # fractional qty
-                                    side=side,
-                                    time_in_force=tif,
+                            if qty <= 0:
+                                alpaca_result = (
+                                    f"Calculated qty <= 0 (qty={qty}), no order placed."
                                 )
-                            )
-                            trade_count += 1
-                            alpaca_result = (
-                                f"Placed {event_type} market order for ~{qty:.4f} units of {symbol}. "
-                                f"Order ID: {order.id}. "
-                                f"trade_count today = {trade_count}."
-                            )
+                            else:
+                                side = (
+                                    OrderSide.BUY
+                                    if event_type == "ENTRY_LONG"
+                                    else OrderSide.SELL
+                                )
+
+                                tif = tif_for_symbol(symbol)
+
+                                # Use 'symbol' exactly as sent from TradingView for orders
+                                order = client.submit_order(
+                                    order_data=MarketOrderRequest(
+                                        symbol=symbol,
+                                        qty=qty,  # fractional qty
+                                        side=side,
+                                        time_in_force=tif,
+                                    )
+                                )
+                                trade_count += 1
+                                alpaca_result = (
+                                    f"Placed {event_type} market order for ~{qty:.6f} units of {symbol}. "
+                                    f"Order ID: {order.id}. "
+                                    f"trade_count today = {trade_count}."
+                                )
 
         # ---- PARTIAL EXIT: close 50% of current position ----
         elif event_type == "PARTIAL_EXIT":
@@ -249,13 +259,13 @@ async def tradingview_webhook(request: Request):
                         )
                     )
                     alpaca_result = (
-                        f"PARTIAL_EXIT: Closed ~50% ({half_qty:.4f} units) of {symbol} "
+                        f"PARTIAL_EXIT: Closed ~50% ({half_qty:.6f} units) of {symbol} "
                         f"({pos_side}). Order ID: {order.id}"
                     )
             except Exception as e:
                 alpaca_result = f"Error during PARTIAL_EXIT for {symbol}: {e}"
 
-            # ---- FINAL EXIT: close entire position & update daily R if stop loser ----
+        # ---- FINAL EXIT: close entire position & update daily R if stop loser ----
         elif event_type == "FINAL_EXIT":
             try:
                 close_symbol = symbol_for_positions(symbol)
